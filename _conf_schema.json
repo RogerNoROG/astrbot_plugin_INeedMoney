@@ -1,0 +1,119 @@
+{
+  "enabled": {
+    "type": "bool",
+    "description": "启用余额监控",
+    "hint": "关闭后不会请求余额接口或主动发送提醒。",
+    "default": false
+  },
+  "account_name": {
+    "type": "string",
+    "description": "AI API 账户名称",
+    "hint": "用于余额查询结果和充值提醒，例如 NewAPI 主账户。",
+    "default": "AI API"
+  },
+  "balance_api_url": {
+    "type": "string",
+    "description": "余额 API 地址",
+    "hint": "完整的 http 或 https 地址。接口必须返回 JSON。",
+    "default": ""
+  },
+  "balance_api_method": {
+    "type": "string",
+    "description": "余额 API 请求方法",
+    "options": ["GET", "POST"],
+    "default": "GET"
+  },
+  "balance_api_token": {
+    "type": "string",
+    "description": "余额 API 令牌",
+    "hint": "例如 Bearer sk-...；留空时不附加此请求头。仅遮罩 WebUI 中的显示，不会加密配置文件。",
+    "secret": true,
+    "default": ""
+  },
+  "token_header_name": {
+    "type": "string",
+    "description": "令牌请求头名称",
+    "hint": "通常为 Authorization。余额 API 令牌会作为该请求头的完整值发送。",
+    "default": "Authorization"
+  },
+  "custom_headers_json": {
+    "type": "text",
+    "description": "额外请求头 JSON",
+    "hint": "可选，必须是字符串键和值组成的 JSON 对象，例如 {\"New-Api-User\": \"1\"}。不要在此处放密钥，密钥请填写“余额 API 令牌”。",
+    "editor_mode": true,
+    "editor_language": "json",
+    "default": "{}"
+  },
+  "balance_api_body_json": {
+    "type": "text",
+    "description": "POST 请求体 JSON",
+    "hint": "仅 POST 请求使用；留空表示不发送 JSON 请求体。",
+    "editor_mode": true,
+    "editor_language": "json",
+    "default": ""
+  },
+  "balance_json_path": {
+    "type": "string",
+    "description": "余额字段 JSON 路径",
+    "hint": "支持点号和数组索引，例如 data.balance、data.accounts[0].remaining 或 $.data.balance。字段必须是剩余余额本身。",
+    "default": "data.balance"
+  },
+  "balance_scale": {
+    "type": "float",
+    "description": "余额换算系数",
+    "hint": "最终余额 = JSON 字段数值 x 此系数。接口已直接返回余额时保持 1。",
+    "default": 1.0
+  },
+  "balance_unit": {
+    "type": "string",
+    "description": "余额单位",
+    "default": "USD"
+  },
+  "low_balance_threshold": {
+    "type": "float",
+    "description": "低余额告警阈值",
+    "hint": "余额严格低于该数值时发送充值提醒。",
+    "default": 5.0
+  },
+  "display_precision": {
+    "type": "int",
+    "description": "余额显示小数位数",
+    "default": 2
+  },
+  "poll_interval_minutes": {
+    "type": "int",
+    "description": "轮询间隔（分钟）",
+    "hint": "最小实际间隔为 30 秒。配置修改后下一轮生效。",
+    "default": 10
+  },
+  "request_timeout_seconds": {
+    "type": "int",
+    "description": "余额 API 请求超时（秒）",
+    "default": 15
+  },
+  "alert_cooldown_minutes": {
+    "type": "int",
+    "description": "同一低余额状态的重复提醒间隔（分钟）",
+    "hint": "余额恢复到阈值及以上后，下次再次低于阈值会立即提醒。设为 0 时每次轮询都提醒。",
+    "default": 360
+  },
+  "notification_sessions": {
+    "type": "list",
+    "description": "允许接收提醒的会话列表",
+    "hint": "填入 unified_msg_origin。管理员在目标群聊或私聊发送 /余额监控会话 可获取。只会向此列表中的会话主动推送。",
+    "default": []
+  },
+  "receipt_code_image": {
+    "type": "file",
+    "description": "收款码图片",
+    "hint": "低余额提醒中附带的收款码。最多使用第一个上传的图片。",
+    "file_types": ["png", "jpg", "jpeg", "webp"],
+    "default": []
+  },
+  "alert_message": {
+    "type": "text",
+    "description": "充值提醒文案",
+    "hint": "可使用 {account_name}、{balance}、{threshold}、{unit}。收款码会在文字后作为独立图片消息段附加。",
+    "default": "[余额告警]\n{account_name} 当前余额为 {balance} {unit}，已低于告警阈值 {threshold} {unit}。\n请及时充值，避免服务中断。"
+  }
+}

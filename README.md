@@ -1,14 +1,59 @@
-# astrbot-plugin-helloworld
+# AI API 余额监控
 
-AstrBot 插件模板 / A template plugin for AstrBot plugin feature
+AstrBot 插件。定时查询一个可配置的 AI API 余额接口；余额低于阈值时，仅向后台白名单中的群聊或私聊主动发送充值提醒，并可附带收款码。
 
-> [!NOTE]
-> This repo is just a template of [AstrBot](https://github.com/AstrBotDevs/AstrBot) Plugin.
-> 
-> [AstrBot](https://github.com/AstrBotDevs/AstrBot) is an agentic assistant for both personal and group conversations. It can be deployed across dozens of mainstream instant messaging platforms, including QQ, Telegram, Feishu, DingTalk, Slack, LINE, Discord, Matrix, etc. In addition, it provides a reliable and extensible conversational AI infrastructure for individuals, developers, and teams. Whether you need a personal AI companion, an intelligent customer support agent, an automation assistant, or an enterprise knowledge base, AstrBot enables you to quickly build AI applications directly within your existing messaging workflows.
+## 安装要求
 
-# Supports
+- AstrBot `>=4.13,<5`
+- 目标消息平台需要支持 AstrBot 的主动消息发送。QQ 官方机器人不支持该能力。
+- 余额服务需要有可供查询的 JSON HTTP 接口。
 
-- [AstrBot Repo](https://github.com/AstrBotDevs/AstrBot)
-- [AstrBot Plugin Development Docs (Chinese)](https://docs.astrbot.app/dev/star/plugin-new.html)
-- [AstrBot Plugin Development Docs (English)](https://docs.astrbot.app/en/dev/star/plugin-new.html)
+安装插件后，请在 AstrBot WebUI 安装 `requirements.txt` 中的依赖，并重载插件。
+
+## 配置步骤
+
+1. 在插件配置中启用“余额监控”。
+2. 填写余额接口的完整 URL、请求方法、令牌及其他请求头。令牌配置项填写的是请求头的完整值，例如 `Bearer sk-xxxx`。
+3. 填写“余额字段 JSON 路径”。它必须指向**剩余余额**这个数值，例如响应为 `{"data":{"balance":12.5}}` 时填 `data.balance`。支持数组索引，如 `data.accounts[0].balance`。
+4. 需要单位换算时配置“余额换算系数”，最终余额为接口返回数值乘以该系数。
+5. 在需要接收通知的群聊或私聊中，用 AstrBot 管理员账号发送 `/余额监控会话`，将返回的会话标识逐项填入“允许接收提醒的会话列表”。只有列表中的会话会收到主动推送。
+6. 上传收款码图片，设置低余额阈值、轮询间隔和重复提醒冷却时间。
+7. 在任意会话中用管理员账号发送 `/余额查询`，验证接口配置和 JSON 路径。
+
+## 命令
+
+| 命令 | 用途 |
+| --- | --- |
+| `/余额查询` | 立即查询余额并返回结果，同时验证接口配置。 |
+| `/余额监控会话` | 返回当前会话的 `unified_msg_origin`，用于配置通知白名单。 |
+| `/余额监控状态` | 查看后台最近一次检查结果，不额外请求余额 API。 |
+
+以上命令均仅限 AstrBot 管理员使用。
+
+## 余额接口示例
+
+如果余额接口响应为：
+
+```json
+{
+  "data": {
+    "remaining": 12.5
+  }
+}
+```
+
+则填写：
+
+- 余额 API 地址：该接口完整地址
+- 余额字段 JSON 路径：`data.remaining`
+- 余额换算系数：`1`
+- 余额单位：`USD`
+
+不同 API 供应商的认证方式和响应结构不同。本插件不会从 AstrBot 当前模型提供商中猜测余额接口，也不会记录 API 令牌或完整响应。对于只返回总额度与已用额度、而非剩余额度的服务，请使用服务商提供的“剩余余额”接口，或经由你自己的轻量代理先计算余额再提供 JSON。
+
+## 行为说明
+
+- 查询失败只写入 AstrBot 插件日志，不发送“余额不足”提醒，避免网络故障导致误报。
+- 余额恢复到阈值及以上后，下次再次低于阈值会立即提醒。
+- 若所有会话发送失败，不会进入冷却期，会在下一轮继续尝试。
+- WebUI 中的“余额 API 令牌”会被遮罩显示，但 AstrBot 的 `secret` 配置不会加密磁盘中的值，请妥善保护部署目录与备份。
