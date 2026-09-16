@@ -21,20 +21,23 @@ DEFAULT_ALERT_MESSAGE = (
     "[余额告警]\n{account_name} 当前余额为 {balance} {unit}，"
     "已低于告警阈值 {threshold} {unit}。\n请及时充值，避免服务中断。"
 )
+DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
+DEEPSEEK_CURRENCY = "CNY"
+REQUEST_TIMEOUT_SECONDS = 15
 
 
 class BalanceQueryError(RuntimeError):
-    """A user-actionable error while reading the configured balance API."""
+    """A user-actionable error while reading a provider balance."""
 
 
 @register(
     "ineedmoney",
     "rog",
     "定时检查 AI API 余额，并在余额不足时主动发送充值提醒。",
-    "1.0.0",
+    "1.0.1",
 )
 class INeedMoneyPlugin(Star):
-    """Query a configurable JSON endpoint and proactively notify allowlisted chats."""
+    """Monitor the balance of a supported AI provider and notify allowlisted chats."""
 
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context, config)
@@ -138,63 +141,156 @@ class INeedMoneyPlugin(Star):
                 self._last_alert_at = time.monotonic()
 
     async def _query_balance(self) -> Decimal:
-        url = self._string_config("balance_api_url").strip()
-        if not url:
-            raise BalanceQueryError("尚未配置余额 API 地址")
-        parsed = urlparse(url)
-        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
-            raise BalanceQueryError("余额 API 地址必须是有效的 http 或 https URL")
+        platform = self._platform_key()
+        if platform == "deepseek":
+            return await self._query_deepseek_balance()
+        if platform == "custom":
+            return await self._query_custom_balance()
+        raise BalanceQueryError("暂不支持所选余额查询平台")
 
-        method = self._string_config("balance_api_method", "GET").upper()
-        if method not in {"GET", "POST"}:
-            raise BalanceQueryError("余额 API 请求方法仅支持 GET 或 POST")
-        request_kwargs: dict[str, Any] = {"headers": self._build_headers()}
-        if method == "POST":
-            request_kwargs["json"] = self._request_json_body()
-
-        timeout = aiohttp.ClientTimeout(
-            total=max(1, self._int_config("request_timeout_seconds", 15))
-        )
+    async def _query_deepseek_balance(self) -> Decimal:
+        """Call the fixed DeepSeek endpoint so users only need to provide an API key."""
+        api_key = self._deepseek_api_key()
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.request(method, url, **request_kwargs) as response:
+                async with session.get(
+                    DEEPSEEK_BALANCE_URL,
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                ) as response:
                     response_text = await response.text()
                     if not 200 <= response.status < 300:
-                        raise BalanceQueryError(f"余额 API 返回 HTTP {response.status}")
+                        raise BalanceQueryError(
+                            f"DeepSeek 余额接口返回 HTTP {response.status}"
+                        )
         except asyncio.CancelledError:
             raise
         except BalanceQueryError:
             raise
         except asyncio.TimeoutError as exc:
-            raise BalanceQueryError("余额 API 请求超时") from exc
+            raise BalanceQueryError("DeepSeek 余额接口请求超时") from exc
         except aiohttp.ClientError as exc:
-            raise BalanceQueryError(f"无法连接余额 API：{exc}") from exc
+            raise BalanceQueryError(f"无法连接 DeepSeek 余额接口：{exc}") from exc
 
         try:
             payload = json.loads(response_text)
         except json.JSONDecodeError as exc:
-            raise BalanceQueryError("余额 API 未返回 JSON 数据") from exc
-        value = self._extract_json_path(
-            payload, self._string_config("balance_json_path", "data.balance")
+            raise BalanceQueryError("DeepSeek 余额接口未返回 JSON 数据") from exc
+        if not isinstance(payload, Mapping):
+            raise BalanceQueryError("DeepSeek 余额接口返回的数据格式无效")
+        if payload.get("is_available") is False:
+            raise BalanceQueryError("DeepSeek 账户当前不可用，请检查账户状态")
+
+        balance_infos = payload.get("balance_infos")
+        if not isinstance(balance_infos, list):
+            raise BalanceQueryError("DeepSeek 响应中没有余额信息")
+        balance_info = next(
+            (
+                item
+                for item in balance_infos
+                if isinstance(item, Mapping)
+                and str(item.get("currency", "")).upper() == DEEPSEEK_CURRENCY
+            ),
+            None,
         )
+        if balance_info is None:
+            raise BalanceQueryError(f"DeepSeek 响应中没有 {DEEPSEEK_CURRENCY} 余额")
+
+        value = balance_info.get("total_balance")
         if value is None or isinstance(value, bool):
-            raise BalanceQueryError("余额字段不是数值")
+            raise BalanceQueryError("DeepSeek 返回的余额不是数值")
         try:
-            balance = Decimal(str(value)) * self._decimal_config("balance_scale", "1")
+            balance = Decimal(str(value))
         except (InvalidOperation, ValueError) as exc:
-            raise BalanceQueryError("余额字段不是可识别的数值") from exc
+            raise BalanceQueryError("DeepSeek 返回的余额不是可识别的数值") from exc
         if not balance.is_finite():
-            raise BalanceQueryError("余额字段不是有限数值")
+            raise BalanceQueryError("DeepSeek 返回的余额不是有限数值")
         return balance
 
-    def _build_headers(self) -> dict[str, str]:
+    def _deepseek_api_key(self) -> str:
+        """Return a bare DeepSeek key; accept the old Bearer form during migration."""
+        api_key = self._string_config("api_key").strip()
+        if not api_key:
+            api_key = self._string_config("balance_api_token").strip()
+        if api_key.lower().startswith("bearer "):
+            api_key = api_key[7:].strip()
+        if not api_key:
+            raise BalanceQueryError("请先在插件配置中填写 DeepSeek API Key")
+        if "\r" in api_key or "\n" in api_key:
+            raise BalanceQueryError("DeepSeek API Key 格式无效")
+        return api_key
+
+    async def _query_custom_balance(self) -> Decimal:
+        """Query an advanced, user-supplied JSON balance endpoint."""
+        custom = self._custom_api_config()
+        url = self._custom_string_config(custom, "balance_api_url").strip()
+        if not url:
+            raise BalanceQueryError("请先在自定义接口配置中填写余额 API 地址")
+        parsed = urlparse(url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise BalanceQueryError("自定义余额 API 地址必须是有效的 http 或 https URL")
+
+        method = self._custom_string_config(custom, "balance_api_method", "GET").upper()
+        if method not in {"GET", "POST"}:
+            raise BalanceQueryError("自定义余额 API 请求方法仅支持 GET 或 POST")
+        request_kwargs: dict[str, Any] = {
+            "headers": self._build_custom_headers(custom)
+        }
+        if method == "POST":
+            request_kwargs["json"] = self._custom_request_json_body(custom)
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.request(method, url, **request_kwargs) as response:
+                    response_text = await response.text()
+                    if not 200 <= response.status < 300:
+                        raise BalanceQueryError(
+                            f"自定义余额 API 返回 HTTP {response.status}"
+                        )
+        except asyncio.CancelledError:
+            raise
+        except BalanceQueryError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise BalanceQueryError("自定义余额 API 请求超时") from exc
+        except aiohttp.ClientError as exc:
+            raise BalanceQueryError(f"无法连接自定义余额 API：{exc}") from exc
+
+        try:
+            payload = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise BalanceQueryError("自定义余额 API 未返回 JSON 数据") from exc
+        value = self._extract_json_path(
+            payload,
+            self._custom_string_config(custom, "balance_json_path", "data.balance"),
+        )
+        if value is None or isinstance(value, bool):
+            raise BalanceQueryError("自定义接口返回的余额不是数值")
+        try:
+            balance = Decimal(str(value)) * self._custom_decimal_config(
+                custom, "balance_scale", "1"
+            )
+        except (InvalidOperation, ValueError) as exc:
+            raise BalanceQueryError("自定义接口返回的余额不是可识别的数值") from exc
+        if not balance.is_finite():
+            raise BalanceQueryError("自定义接口返回的余额不是有限数值")
+        return balance
+
+    def _build_custom_headers(self, custom: Mapping[str, Any]) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        token = self._string_config("balance_api_token")
+        token = self._custom_string_config(custom, "api_token")
         if token:
-            name = self._string_config("token_header_name", "Authorization")
+            name = self._custom_string_config(
+                custom, "token_header_name", "Authorization"
+            )
             self._validate_header(name, token)
             headers[name] = token
-        custom_headers_text = self._string_config("custom_headers_json")
+
+        custom_headers_text = self._custom_string_config(custom, "custom_headers_json")
         if not custom_headers_text.strip():
             return headers
         try:
@@ -217,26 +313,26 @@ class INeedMoneyPlugin(Star):
         if "\r" in value or "\n" in value:
             raise BalanceQueryError("请求头值不合法")
 
-    def _request_json_body(self) -> Any:
-        body = self._string_config("balance_api_body_json")
+    def _custom_request_json_body(self, custom: Mapping[str, Any]) -> Any:
+        body = self._custom_string_config(custom, "balance_api_body_json")
         if not body.strip():
             return None
         try:
             return json.loads(body)
         except json.JSONDecodeError as exc:
-            raise BalanceQueryError("请求体不是合法 JSON") from exc
+            raise BalanceQueryError("自定义请求体不是合法 JSON") from exc
 
     @staticmethod
     def _extract_json_path(payload: Any, path: str) -> Any:
         """Read dotted object keys and numeric indexes, e.g. data.users[0].balance."""
         path = path.strip().removeprefix("$").lstrip(".")
         if not path:
-            raise BalanceQueryError("余额 JSON 路径不能为空")
+            raise BalanceQueryError("自定义余额 JSON 路径不能为空")
         current = payload
         for segment in path.split("."):
             match = re.fullmatch(r"([^\[\]]+)((?:\[\d+\])*)", segment)
             if not match:
-                raise BalanceQueryError(f"余额 JSON 路径格式无效：{path}")
+                raise BalanceQueryError(f"自定义余额 JSON 路径格式无效：{path}")
             key, indexes = match.groups()
             if not isinstance(current, Mapping) or key not in current:
                 raise BalanceQueryError(f"响应中找不到余额字段：{path}")
@@ -274,30 +370,63 @@ class INeedMoneyPlugin(Star):
         return delivered
 
     def _alert_text(self, balance: Decimal, threshold: Decimal) -> str:
-        precision = min(8, max(0, self._int_config("display_precision", 2)))
         fields = {
-            "account_name": self._string_config("account_name", "AI API"),
-            "balance": f"{balance:.{precision}f}",
-            "threshold": f"{threshold:.{precision}f}",
-            "unit": self._string_config("balance_unit", "USD"),
+            "account_name": self._platform_display_name(),
+            "balance": f"{balance:.2f}",
+            "threshold": f"{threshold:.2f}",
+            "unit": self._platform_currency(),
         }
-        template = self._string_config("alert_message", DEFAULT_ALERT_MESSAGE)
-        try:
-            return template.format(**fields)
-        except (KeyError, ValueError, IndexError):
-            logger.warning("Invalid alert message template; using the default template.")
-            return DEFAULT_ALERT_MESSAGE.format(**fields)
+        return DEFAULT_ALERT_MESSAGE.format(**fields)
 
     def _balance_status_text(self, balance: Decimal) -> str:
         threshold = self._decimal_config("low_balance_threshold")
-        precision = min(8, max(0, self._int_config("display_precision", 2)))
-        unit = self._string_config("balance_unit", "USD")
         level = "余额不足" if balance < threshold else "余额充足"
         return (
-            f"{self._string_config('account_name', 'AI API')} 当前余额："
-            f"{balance:.{precision}f} {unit}\n"
-            f"告警阈值：{threshold:.{precision}f} {unit}\n状态：{level}"
+            f"{self._platform_display_name()} 当前余额："
+            f"{balance:.2f} {self._platform_currency()}\n"
+            f"告警阈值：{threshold:.2f} {self._platform_currency()}\n状态：{level}"
         )
+
+    def _platform_display_name(self) -> str:
+        if self._platform_key() == "deepseek":
+            return "DeepSeek"
+        return self._custom_string_config(
+            self._custom_api_config(), "account_name", "自定义 AI API"
+        )
+
+    def _platform_currency(self) -> str:
+        if self._platform_key() == "deepseek":
+            return DEEPSEEK_CURRENCY
+        return self._custom_string_config(
+            self._custom_api_config(), "balance_unit", "USD"
+        )
+
+    def _platform_key(self) -> str:
+        platform = self._string_config("platform", "deepseek").strip().lower()
+        return "custom" if platform in {"custom", "自定义接口"} else platform
+
+    def _custom_api_config(self) -> Mapping[str, Any]:
+        value = self.config.get("custom_api", {})
+        return value if isinstance(value, Mapping) else {}
+
+    @staticmethod
+    def _custom_string_config(
+        custom: Mapping[str, Any], key: str, default: str = ""
+    ) -> str:
+        value = custom.get(key, default)
+        return value if isinstance(value, str) else default
+
+    @staticmethod
+    def _custom_decimal_config(
+        custom: Mapping[str, Any], key: str, default: str = "0"
+    ) -> Decimal:
+        try:
+            value = Decimal(str(custom.get(key, default)))
+        except (InvalidOperation, ValueError, TypeError):
+            raise BalanceQueryError(f"自定义接口配置项 {key} 不是有效数值") from None
+        if not value.is_finite():
+            raise BalanceQueryError(f"自定义接口配置项 {key} 不是有限数值")
+        return value
 
     def _alert_is_due(self) -> bool:
         if self._last_alert_at is None:
@@ -321,7 +450,7 @@ class INeedMoneyPlugin(Star):
         return bool(self.config.get("enabled", False))
 
     def _poll_interval_seconds(self) -> int:
-        return max(30, self._int_config("poll_interval_minutes", 10) * 60)
+        return max(60, self._int_config("poll_interval_minutes", 10) * 60)
 
     def _string_config(self, key: str, default: str = "") -> str:
         value = self.config.get(key, default)
