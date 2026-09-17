@@ -436,48 +436,115 @@ class INeedMoneyPlugin(Star):
             "threshold": f"{threshold:.2f}",
             "unit": self._platform_currency(),
         }
-        template = await self._persona_alert_template(session)
+        template, persona_prompt = await self._persona_alert_context(session)
         try:
-            return template.format(**fields)
+            rendered_template = template.format(**fields)
         except (KeyError, ValueError):
-            return DEFAULT_ALERT_MESSAGE.format(**fields)
+            rendered_template = DEFAULT_ALERT_MESSAGE.format(**fields)
+        return await self._generate_persona_alert(
+            rendered_template, fields, persona_prompt, session
+        )
 
-    async def _persona_alert_template(self, session: str | None) -> str:
+    async def _persona_alert_context(
+        self, session: str | None
+    ) -> tuple[str, str | None]:
         default_template = self._string_config(
             "alert_message_template", DEFAULT_ALERT_MESSAGE
         )
         if not session:
-            return default_template
+            return default_template, None
 
         conversation_manager = getattr(self.context, "conversation_manager", None)
         if conversation_manager is None:
-            return default_template
+            return default_template, None
+        conversation_persona_id = None
         try:
             conversation_id = await conversation_manager.get_curr_conversation_id(
                 session
             )
             if not conversation_id:
-                return default_template
-            conversation = await conversation_manager.get_conversation(
-                session, conversation_id
-            )
-            persona_id = getattr(conversation, "persona_id", None)
+                conversation = None
+            else:
+                conversation = await conversation_manager.get_conversation(
+                    session, conversation_id
+                )
+            conversation_persona_id = getattr(conversation, "persona_id", None)
         except Exception:
             logger.exception("Failed to resolve persona for alert session %s.", session)
-            return default_template
+            return default_template, None
+
+        persona_id = conversation_persona_id
+        persona_prompt = None
+        persona_manager = getattr(self.context, "persona_manager", None)
+        if persona_manager is not None and hasattr(
+            persona_manager, "resolve_selected_persona"
+        ):
+            try:
+                resolved_id, persona, _, _ = (
+                    await persona_manager.resolve_selected_persona(
+                        umo=session,
+                        conversation_persona_id=conversation_persona_id,
+                        platform_name=session.split(":", 1)[0],
+                    )
+                )
+                persona_id = resolved_id
+                if isinstance(persona, Mapping):
+                    persona_prompt = persona.get("prompt")
+                else:
+                    persona_prompt = getattr(persona, "prompt", None)
+            except Exception:
+                logger.exception("Failed to resolve Persona details for %s.", session)
 
         if not persona_id:
-            return default_template
+            return default_template, persona_prompt
         templates = self.config.get("alert_persona_templates", [])
         if not isinstance(templates, list):
-            return default_template
+            return default_template, persona_prompt
         for item in templates:
             if not isinstance(item, Mapping):
                 continue
             if item.get("persona_id") == persona_id:
                 template = item.get("template")
-                return template if isinstance(template, str) and template else default_template
-        return default_template
+                if isinstance(template, str) and template:
+                    return template, persona_prompt
+        return default_template, persona_prompt
+
+    async def _generate_persona_alert(
+        self,
+        rendered_template: str,
+        fields: Mapping[str, str],
+        persona_prompt: str | None,
+        session: str | None,
+    ) -> str:
+        """Let the active Persona rewrite the template without changing facts."""
+        if not session or not persona_prompt:
+            return rendered_template
+        try:
+            provider_id = await self.context.get_current_chat_provider_id(session)
+            prompt = (
+                "请把下面的余额提醒模板改写成一条可以直接发送给用户的消息。\n"
+                "必须遵循当前 Persona 的语气，但不要解释改写过程，不要添加标题、Markdown 或引号。\n"
+                "必须保留以下事实值，不能修改、四舍五入、翻译或省略："
+                f"账户={fields['account_name']}，余额={fields['balance']}，"
+                f"阈值={fields['threshold']}，单位={fields['unit']}。\n\n"
+                f"余额提醒模板：\n{rendered_template}"
+            )
+            response = await self.context.llm_generate(
+                chat_provider_id=provider_id,
+                prompt=prompt,
+                system_prompt=persona_prompt,
+            )
+            generated = (response.completion_text or "").strip()
+            if generated and all(value in generated for value in fields.values()):
+                return generated
+            logger.warning(
+                "Persona-generated alert did not preserve all balance facts; using template."
+            )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Failed to generate Persona-based balance alert.")
+        return rendered_template
 
     def _balance_status_text(self, balance: Decimal) -> str:
         threshold = self._decimal_config("low_balance_threshold")
