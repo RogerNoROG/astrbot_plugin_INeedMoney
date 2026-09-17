@@ -23,6 +23,10 @@ DEFAULT_ALERT_MESSAGE = (
     "[余额告警]\n{account_name} 当前余额为 {balance} {unit}，"
     "已低于告警阈值 {threshold} {unit}。\n请及时充值，避免服务中断。"
 )
+DEFAULT_RECOVERY_MESSAGE = (
+    "[余额恢复]\n{account_name} 当前余额已恢复至 {balance} {unit}，"
+    "高于告警阈值 {threshold} {unit}。\n感谢您的支持！"
+)
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 DEEPSEEK_CURRENCY = "CNY"
 REQUEST_TIMEOUT_SECONDS = 15
@@ -182,6 +186,7 @@ class INeedMoneyPlugin(Star):
             if balance >= threshold:
                 if self._is_low_balance:
                     logger.info("Balance recovered above the configured threshold.")
+                    await self._send_recovery_notice(balance, threshold)
                 self._is_low_balance, self._last_alert_at = False, None
                 return
 
@@ -190,6 +195,36 @@ class INeedMoneyPlugin(Star):
                 return
             if await self._send_low_balance_alert(balance, threshold):
                 self._last_alert_at = time.monotonic()
+
+    async def _send_recovery_notice(
+        self, balance: Decimal, threshold: Decimal
+    ) -> bool:
+        sessions = self._string_list_config("notification_sessions")
+        if not sessions:
+            logger.warning(
+                "Balance recovered, but no notification sessions are configured."
+            )
+            return False
+
+        delivered = False
+        for session in sessions:
+            chain = MessageChain().message(
+                await self._recovery_text(balance, threshold, session)
+            )
+            try:
+                sent = await self.context.send_message(session, chain)
+                delivered = delivered or sent
+                if not sent:
+                    logger.warning(
+                        "Recovery notice was not delivered to session %s.", session
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.exception(
+                    "Failed to send recovery notice to session %s.", session
+                )
+        return delivered
 
     async def _query_balance(self) -> Decimal:
         platform = self._platform_key()
@@ -445,6 +480,27 @@ class INeedMoneyPlugin(Star):
             rendered_template, fields, persona_prompt, session
         )
 
+    async def _recovery_text(
+        self, balance: Decimal, threshold: Decimal, session: str | None = None
+    ) -> str:
+        fields = {
+            "account_name": self._platform_display_name(),
+            "balance": f"{balance:.2f}",
+            "threshold": f"{threshold:.2f}",
+            "unit": self._platform_currency(),
+        }
+        _, persona_prompt = await self._persona_alert_context(session)
+        template = self._string_config(
+            "recovery_message_template", DEFAULT_RECOVERY_MESSAGE
+        )
+        try:
+            rendered_template = template.format(**fields)
+        except (KeyError, ValueError):
+            rendered_template = DEFAULT_RECOVERY_MESSAGE.format(**fields)
+        return await self._generate_persona_alert(
+            rendered_template, fields, persona_prompt, session
+        )
+
     async def _persona_alert_context(
         self, session: str | None
     ) -> tuple[str, str | None]:
@@ -495,18 +551,6 @@ class INeedMoneyPlugin(Star):
             except Exception:
                 logger.exception("Failed to resolve Persona details for %s.", session)
 
-        if not persona_id:
-            return default_template, persona_prompt
-        templates = self.config.get("alert_persona_templates", [])
-        if not isinstance(templates, list):
-            return default_template, persona_prompt
-        for item in templates:
-            if not isinstance(item, Mapping):
-                continue
-            if item.get("persona_id") == persona_id:
-                template = item.get("template")
-                if isinstance(template, str) and template:
-                    return template, persona_prompt
         return default_template, persona_prompt
 
     async def _generate_persona_alert(

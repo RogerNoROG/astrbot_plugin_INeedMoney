@@ -5,30 +5,11 @@
     "hint": "这是交给当前对话人格改写的预置模板，支持 {account_name}、{balance}、{threshold}、{unit} 这些占位符。",
     "default": "[余额告警]\n{account_name} 当前余额为 {balance} {unit}，已低于告警阈值 {threshold} {unit}。\n请及时充值，避免服务中断。"
   },
-  "alert_persona_templates": {
-    "type": "template_list",
-    "description": "人格告警模板",
-    "hint": "按 AstrBot Persona ID 配置不同对话的人格文案；未匹配时使用上面的默认模板。",
-    "templates": {
-      "persona_template": {
-        "name": "人格模板",
-        "display_item": "persona_id",
-        "items": {
-          "persona_id": {
-            "type": "string",
-            "_special": "select_persona",
-            "description": "Persona",
-            "hint": "从 AstrBot 已配置的人格列表中选择。"
-          },
-          "template": {
-            "type": "text",
-            "description": "该人格的余额提醒模板",
-            "hint": "这是交给该人格改写的预置模板，支持 {account_name}、{balance}、{threshold}、{unit} 占位符。"
-          }
-        }
-      }
-    },
-    "default": []
+  "recovery_message_template": {
+    "type": "text",
+    "description": "余额恢复感谢模板",
+    "hint": "余额从低于阈值恢复到阈值以上时发送，并由当前对话人格改写。支持 {account_name}、{balance}、{threshold}、{unit} 占位符。",
+    "default": "[余额恢复]\n{account_name} 当前余额已恢复至 {balance} {unit}，高于告警阈值 {threshold} {unit}。\n感谢您的支持！"
   },
   "enabled": {
     "type": "bool",
