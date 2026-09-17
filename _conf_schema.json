@@ -1,10 +1,8 @@
 {
   "alert_message_template": {
-    "type": "text",
+    "type": "string",
     "description": "余额提醒模板",
     "hint": "可自定义告警文案，支持 {account_name}、{balance}、{threshold}、{unit} 这些占位符。",
-    "editor_mode": true,
-    "editor_language": "text",
     "default": "[余额告警]\n{account_name} 当前余额为 {balance} {unit}，已低于告警阈值 {threshold} {unit}。\n请及时充值，避免服务中断。"
   },
   "enabled": {
@@ -64,19 +62,15 @@
         "default": "Authorization"
       },
       "custom_headers_json": {
-        "type": "text",
+        "type": "string",
         "description": "额外请求头 JSON",
         "hint": "可选。必须是字符串键和值组成的 JSON 对象，例如 {\"X-Account-ID\": \"123\"}。不要在此填写令牌。",
-        "editor_mode": true,
-        "editor_language": "json",
         "default": "{}"
       },
       "balance_api_body_json": {
-        "type": "text",
+        "type": "string",
         "description": "POST 请求体 JSON",
         "hint": "仅 POST 请求使用；留空表示不发送 JSON 请求体。",
-        "editor_mode": true,
-        "editor_language": "json",
         "default": ""
       },
       "balance_json_path": {
