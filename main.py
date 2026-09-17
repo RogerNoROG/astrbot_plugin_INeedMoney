@@ -595,9 +595,36 @@ class INeedMoneyPlugin(Star):
         if not session or not persona_prompt:
             return rendered_template
         try:
+            conversation_manager = getattr(self.context, "conversation_manager", None)
+            conversation_id = None
+            conversation = None
+            contexts: list[dict[str, Any]] = []
+            if conversation_manager is not None:
+                conversation_id = await conversation_manager.get_curr_conversation_id(
+                    session
+                )
+                if conversation_id:
+                    conversation = await conversation_manager.get_conversation(
+                        session, conversation_id
+                    )
+                if conversation is not None:
+                    try:
+                        history = json.loads(conversation.history or "[]")
+                        if isinstance(history, list):
+                            contexts = [
+                                item for item in history if isinstance(item, dict)
+                            ]
+                    except (TypeError, json.JSONDecodeError):
+                        logger.warning(
+                            "Failed to read conversation history for alert session %s.",
+                            session,
+                        )
             provider_id = await self.context.get_current_chat_provider_id(session)
+            temperature = self._decimal_config("alert_temperature", "1.0")
+            temperature = min(Decimal("2"), max(Decimal("0"), temperature))
             logger.info(
-                "Generating Persona-based balance message for session %s with provider %s.",
+                "Generating Persona-based balance message in native conversation "
+                "for session %s with provider %s.",
                 session,
                 provider_id,
             )
@@ -613,11 +640,24 @@ class INeedMoneyPlugin(Star):
                 chat_provider_id=provider_id,
                 prompt=prompt,
                 system_prompt=persona_prompt,
+                contexts=contexts,
+                temperature=float(temperature),
             )
             generated = (response.completion_text or "").strip()
             if generated and all(value in generated for value in fields.values()):
+                if conversation_manager is not None:
+                    if conversation_id is None:
+                        conversation_id = await conversation_manager.new_conversation(
+                            session, session.split(":", 1)[0]
+                        )
+                    await conversation_manager.add_message_pair(
+                        conversation_id,
+                        {"role": "user", "content": prompt},
+                        {"role": "assistant", "content": generated},
+                    )
                 logger.info(
-                    "Persona-based balance message generated successfully for session %s.",
+                    "Persona-based balance message generated and saved to native "
+                    "conversation for session %s.",
                     session,
                 )
                 return generated

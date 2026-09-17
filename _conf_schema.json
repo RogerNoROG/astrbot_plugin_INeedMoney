@@ -11,6 +11,12 @@
     "hint": "余额从低于阈值恢复到阈值以上时发送，并由当前对话人格改写。支持 {account_name}、{balance}、{threshold}、{unit} 占位符。",
     "default": "[余额恢复]\n{account_name} 当前余额已恢复至 {balance} {unit}，高于告警阈值 {threshold} {unit}。\n感谢您的支持！"
   },
+  "alert_temperature": {
+    "type": "float",
+    "description": "告警 AI 温度",
+    "hint": "用于控制告警文案的变化程度，范围 0 到 2；数值越高，表达越灵活。",
+    "default": 1.0
+  },
   "enabled": {
     "type": "bool",
     "description": "启用余额监控",
