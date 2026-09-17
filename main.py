@@ -118,6 +118,27 @@ class INeedMoneyPlugin(Star):
         except BalanceQueryError as exc:
             yield event.plain_result(f"余额告警测试失败：{exc}")
 
+    @filter.command("余额恢复测试")
+    async def test_recovery_in_chat(self, event: AstrMessageEvent):
+        """管理员：使用示例高余额在当前会话测试恢复感谢消息。"""
+        if not event.is_admin():
+            yield event.plain_result("此命令仅 AstrBot 管理员可用。")
+            return
+        try:
+            threshold = self._decimal_config("low_balance_threshold")
+            if threshold < 0:
+                raise BalanceQueryError("配置项 low_balance_threshold 不能小于 0")
+            test_threshold = threshold
+            test_balance = threshold + (Decimal("1") if threshold >= 0 else Decimal("2"))
+            yield event.plain_result(
+                "[余额恢复测试]\n"
+                + await self._recovery_text(
+                    test_balance, test_threshold, event.unified_msg_origin
+                )
+            )
+        except BalanceQueryError as exc:
+            yield event.plain_result(f"余额恢复测试失败：{exc}")
+
     @filter.command("余额监控会话")
     async def show_session_id(self, event: AstrMessageEvent):
         """管理员：显示此群聊或私聊对应的主动消息会话 ID。"""
@@ -548,9 +569,19 @@ class INeedMoneyPlugin(Star):
                     persona_prompt = persona.get("prompt")
                 else:
                     persona_prompt = getattr(persona, "prompt", None)
+                    if not persona_prompt:
+                        try:
+                            persona_prompt = persona["prompt"]
+                        except (KeyError, TypeError, IndexError):
+                            persona_prompt = None
             except Exception:
                 logger.exception("Failed to resolve Persona details for %s.", session)
 
+        if not persona_prompt:
+            logger.warning(
+                "Persona alert generation skipped for session %s: no Persona prompt resolved.",
+                session,
+            )
         return default_template, persona_prompt
 
     async def _generate_persona_alert(
@@ -565,6 +596,11 @@ class INeedMoneyPlugin(Star):
             return rendered_template
         try:
             provider_id = await self.context.get_current_chat_provider_id(session)
+            logger.info(
+                "Generating Persona-based balance message for session %s with provider %s.",
+                session,
+                provider_id,
+            )
             prompt = (
                 "请把下面的余额提醒模板改写成一条可以直接发送给用户的消息。\n"
                 "必须遵循当前 Persona 的语气，但不要解释改写过程，不要添加标题、Markdown 或引号。\n"
@@ -580,14 +616,18 @@ class INeedMoneyPlugin(Star):
             )
             generated = (response.completion_text or "").strip()
             if generated and all(value in generated for value in fields.values()):
+                logger.info(
+                    "Persona-based balance message generated successfully for session %s.",
+                    session,
+                )
                 return generated
             logger.warning(
-                "Persona-generated alert did not preserve all balance facts; using template."
+                "Persona-generated balance message did not preserve all balance facts; using template."
             )
         except asyncio.CancelledError:
             raise
         except Exception:
-            logger.exception("Failed to generate Persona-based balance alert.")
+            logger.exception("Failed to generate Persona-based balance message.")
         return rendered_template
 
     def _balance_status_text(self, balance: Decimal) -> str:
