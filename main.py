@@ -79,6 +79,31 @@ class INeedMoneyPlugin(Star):
         except BalanceQueryError as exc:
             yield event.plain_result(f"余额查询失败：{exc}")
 
+    @filter.command("余额告警测试")
+    async def test_alert_in_chat(self, event: AstrMessageEvent):
+        """管理员：使用示例低余额在当前会话测试告警样式。"""
+        if not event.is_admin():
+            yield event.plain_result("此命令仅 AstrBot 管理员可用。")
+            return
+        try:
+            threshold = self._decimal_config("low_balance_threshold")
+            if threshold < 0:
+                raise BalanceQueryError("配置项 low_balance_threshold 不能小于 0")
+            test_threshold = threshold if threshold > 0 else Decimal("1")
+            test_balance = test_threshold / Decimal("2")
+            chain = MessageChain().message(
+                "[告警样式测试]\n" + self._alert_text(test_balance, test_threshold)
+            )
+            image = self._receipt_image_source()
+            if image:
+                if image.startswith(("http://", "https://")):
+                    chain.url_image(image)
+                else:
+                    chain.file_image(image)
+            yield event.chain_result(chain)
+        except BalanceQueryError as exc:
+            yield event.plain_result(f"余额告警测试失败：{exc}")
+
     @filter.command("余额监控会话")
     async def show_session_id(self, event: AstrMessageEvent):
         """管理员：显示此群聊或私聊对应的主动消息会话 ID。"""
