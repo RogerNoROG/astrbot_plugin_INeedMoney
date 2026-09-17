@@ -94,7 +94,10 @@ class INeedMoneyPlugin(Star):
             test_threshold = threshold if threshold > 0 else Decimal("1")
             test_balance = test_threshold / Decimal("2")
             chain = MessageChain().message(
-                "[告警样式测试]\n" + self._alert_text(test_balance, test_threshold)
+                "[告警样式测试]\n"
+                + await self._alert_text(
+                    test_balance, test_threshold, event.unified_msg_origin
+                )
             )
             image = self._receipt_image_source()
             if image:
@@ -121,6 +124,22 @@ class INeedMoneyPlugin(Star):
             "将下面的会话标识复制到插件配置的“允许接收提醒的会话列表”中：\n"
             f"{event.unified_msg_origin}"
         )
+
+    @filter.command("余额监控会话添加")
+    async def add_notification_session(self, event: AstrMessageEvent):
+        """管理员：将当前群聊或私聊加入余额提醒会话列表。"""
+        if not event.is_admin():
+            yield event.plain_result("此命令仅 AstrBot 管理员可用。")
+            return
+        session = event.unified_msg_origin.strip()
+        sessions = self._string_list_config("notification_sessions")
+        if session not in sessions:
+            sessions.append(session)
+            self.config["notification_sessions"] = sessions
+            self.config.save_config()
+            yield event.plain_result("当前会话已加入余额提醒列表。")
+        else:
+            yield event.plain_result("当前会话已经在余额提醒列表中。")
 
     @filter.command("余额监控状态")
     async def monitor_status(self, event: AstrMessageEvent):
@@ -384,7 +403,9 @@ class INeedMoneyPlugin(Star):
             return False
         delivered, image = False, self._receipt_image_source()
         for session in sessions:
-            chain = MessageChain().message(self._alert_text(balance, threshold))
+            chain = MessageChain().message(
+                await self._alert_text(balance, threshold, session)
+            )
             if image:
                 if image.startswith(("http://", "https://")):
                     chain.url_image(image)
@@ -406,18 +427,57 @@ class INeedMoneyPlugin(Star):
                 logger.exception("Failed to send balance alert to session %s.", session)
         return delivered
 
-    def _alert_text(self, balance: Decimal, threshold: Decimal) -> str:
+    async def _alert_text(
+        self, balance: Decimal, threshold: Decimal, session: str | None = None
+    ) -> str:
         fields = {
             "account_name": self._platform_display_name(),
             "balance": f"{balance:.2f}",
             "threshold": f"{threshold:.2f}",
             "unit": self._platform_currency(),
         }
-        template = self._string_config("alert_message_template", DEFAULT_ALERT_MESSAGE)
+        template = await self._persona_alert_template(session)
         try:
             return template.format(**fields)
         except (KeyError, ValueError):
             return DEFAULT_ALERT_MESSAGE.format(**fields)
+
+    async def _persona_alert_template(self, session: str | None) -> str:
+        default_template = self._string_config(
+            "alert_message_template", DEFAULT_ALERT_MESSAGE
+        )
+        if not session:
+            return default_template
+
+        conversation_manager = getattr(self.context, "conversation_manager", None)
+        if conversation_manager is None:
+            return default_template
+        try:
+            conversation_id = await conversation_manager.get_curr_conversation_id(
+                session
+            )
+            if not conversation_id:
+                return default_template
+            conversation = await conversation_manager.get_conversation(
+                session, conversation_id
+            )
+            persona_id = getattr(conversation, "persona_id", None)
+        except Exception:
+            logger.exception("Failed to resolve persona for alert session %s.", session)
+            return default_template
+
+        if not persona_id:
+            return default_template
+        templates = self.config.get("alert_persona_templates", [])
+        if not isinstance(templates, list):
+            return default_template
+        for item in templates:
+            if not isinstance(item, Mapping):
+                continue
+            if item.get("persona_id") == persona_id:
+                template = item.get("template")
+                return template if isinstance(template, str) and template else default_template
+        return default_template
 
     def _balance_status_text(self, balance: Decimal) -> str:
         threshold = self._decimal_config("low_balance_threshold")
