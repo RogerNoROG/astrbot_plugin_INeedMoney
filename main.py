@@ -8,6 +8,7 @@ import re
 import time
 from collections.abc import Mapping
 from decimal import Decimal, InvalidOperation
+from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
@@ -15,6 +16,7 @@ import aiohttp
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, MessageChain, filter
 from astrbot.api.star import Context, Star, register
+from astrbot.core.utils.astrbot_path import get_astrbot_plugin_data_path
 
 
 DEFAULT_ALERT_MESSAGE = (
@@ -98,8 +100,13 @@ class INeedMoneyPlugin(Star):
             if image:
                 if image.startswith(("http://", "https://")):
                     chain.url_image(image)
-                else:
+                elif Path(image).is_file():
                     chain.file_image(image)
+                else:
+                    logger.warning(
+                        "Receipt code image does not exist, sending alert without it: %s",
+                        image,
+                    )
             yield event.chain_result(chain)
         except BalanceQueryError as exc:
             yield event.plain_result(f"余额告警测试失败：{exc}")
@@ -381,8 +388,13 @@ class INeedMoneyPlugin(Star):
             if image:
                 if image.startswith(("http://", "https://")):
                     chain.url_image(image)
-                else:
+                elif Path(image).is_file():
                     chain.file_image(image)
+                else:
+                    logger.warning(
+                        "Receipt code image does not exist, sending alert without it: %s",
+                        image,
+                    )
             try:
                 sent = await self.context.send_message(session, chain)
                 delivered = delivered or sent
@@ -473,7 +485,26 @@ class INeedMoneyPlugin(Star):
                 (value.get(key) for key in ("path", "file", "url", "value") if value.get(key)),
                 "",
             )
-        return value.strip() if isinstance(value, str) else ""
+        if not isinstance(value, str):
+            return ""
+
+        image = value.strip()
+        if not image or image.startswith(("http://", "https://")):
+            return image
+
+        candidates = [Path(image)]
+        normalized = image.replace("\\", "/").lstrip("/")
+        if normalized.startswith("AstrBot/"):
+            normalized = normalized.removeprefix("AstrBot/")
+        if normalized.startswith("files/"):
+            candidates.append(
+                Path(get_astrbot_plugin_data_path()) / "ineedmoney" / normalized
+            )
+
+        for candidate in candidates:
+            if candidate.is_file():
+                return str(candidate)
+        return image
 
     def _enabled(self) -> bool:
         return bool(self.config.get("enabled", False))
