@@ -103,17 +103,7 @@ class INeedMoneyPlugin(Star):
                     test_balance, test_threshold, event.unified_msg_origin
                 )
             )
-            image = self._receipt_image_source()
-            if image:
-                if image.startswith(("http://", "https://")):
-                    chain.url_image(image)
-                elif Path(image).is_file():
-                    chain.file_image(image)
-                else:
-                    logger.warning(
-                        "Receipt code image does not exist, sending alert without it: %s",
-                        image,
-                    )
+            self._append_receipt_images(chain)
             yield event.chain_result(chain)
         except BalanceQueryError as exc:
             yield event.plain_result(f"余额告警测试失败：{exc}")
@@ -457,21 +447,12 @@ class INeedMoneyPlugin(Star):
         if not sessions:
             logger.warning("Balance is low, but no notification sessions are configured.")
             return False
-        delivered, image = False, self._receipt_image_source()
+        delivered = False
         for session in sessions:
             chain = MessageChain().message(
                 await self._alert_text(balance, threshold, session)
             )
-            if image:
-                if image.startswith(("http://", "https://")):
-                    chain.url_image(image)
-                elif Path(image).is_file():
-                    chain.file_image(image)
-                else:
-                    logger.warning(
-                        "Receipt code image does not exist, sending alert without it: %s",
-                        image,
-                    )
+            self._append_receipt_images(chain)
             try:
                 sent = await self.context.send_message(session, chain)
                 delivered = delivered or sent
@@ -754,21 +735,35 @@ class INeedMoneyPlugin(Star):
         cooldown = max(0, self._int_config("alert_cooldown_minutes", 360)) * 60
         return time.monotonic() - self._last_alert_at >= cooldown
 
-    def _receipt_image_source(self) -> str:
-        """Handle both string and object variants returned by AstrBot file fields."""
+    def _receipt_image_sources(self) -> list[str]:
+        """Resolve every configured receipt code, keeping the upload order."""
         value = self.config.get("receipt_code_image", [])
-        if isinstance(value, list):
-            value = value[0] if value else ""
-        if isinstance(value, Mapping):
-            value = next(
-                (value.get(key) for key in ("path", "file", "url", "value") if value.get(key)),
+        entries = value if isinstance(value, list) else [value]
+        sources: list[str] = []
+        for entry in entries:
+            source = self._resolve_receipt_image(entry)
+            if source and source not in sources:
+                sources.append(source)
+        return sources
+
+    def _resolve_receipt_image(self, entry: Any) -> str:
+        """Handle string, url and object variants returned by AstrBot file fields."""
+        if isinstance(entry, Mapping):
+            entry = next(
+                (
+                    entry.get(key)
+                    for key in ("path", "file", "url", "value")
+                    if entry.get(key)
+                ),
                 "",
             )
-        if not isinstance(value, str):
+        if not isinstance(entry, str):
             return ""
 
-        image = value.strip()
-        if not image or image.startswith(("http://", "https://")):
+        image = entry.strip()
+        if not image:
+            return ""
+        if image.startswith(("http://", "https://")):
             return image
 
         candidates = [Path(image)]
@@ -783,7 +778,15 @@ class INeedMoneyPlugin(Star):
         for candidate in candidates:
             if candidate.is_file():
                 return str(candidate)
-        return image
+        logger.warning("Receipt code image does not exist and was skipped: %s", image)
+        return ""
+
+    def _append_receipt_images(self, chain: MessageChain) -> None:
+        for image in self._receipt_image_sources():
+            if image.startswith(("http://", "https://")):
+                chain.url_image(image)
+            else:
+                chain.file_image(image)
 
     def _enabled(self) -> bool:
         return bool(self.config.get("enabled", False))

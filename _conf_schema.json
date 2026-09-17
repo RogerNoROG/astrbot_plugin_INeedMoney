@@ -132,8 +132,8 @@
   },
   "receipt_code_image": {
     "type": "file",
-    "description": "收款码图片",
-    "hint": "低余额提醒中附带的收款码。最多使用第一个上传的图片。",
+    "description": "收款码图片（可多张）",
+    "hint": "低余额提醒中附带的收款码，可上传多张，例如不同平台的收款码，会按上传顺序全部发送。",
     "file_types": ["png", "jpg", "jpeg", "webp"],
     "default": []
   }
