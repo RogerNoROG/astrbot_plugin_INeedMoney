@@ -54,13 +54,14 @@ class INeedMoneyPlugin(Star):
         self.config = config
         self._polling_task: asyncio.Task | None = None
         self._check_lock = asyncio.Lock()
-        self._last_alert_at: float | None = None
-        self._last_balance: Decimal | None = None
-        self._last_query_error: str | None = None
-        self._is_low_balance = False
+        self._last_alert_at: dict[str, float] = {}
+        self._last_balances: dict[str, Decimal] = {}
+        self._last_query_errors: dict[str, str] = {}
+        self._low_balance_states: dict[str, bool] = {}
 
     async def initialize(self) -> None:
         """Start one lifecycle-managed task; it rereads WebUI settings each cycle."""
+        self._migrate_legacy_config()
         self._polling_task = asyncio.create_task(
             self._poll_loop(), name="ineedmoney-balance-monitor"
         )
@@ -78,20 +79,34 @@ class INeedMoneyPlugin(Star):
 
     @filter.command("余额查询")
     async def query_balance(self, event: AstrMessageEvent):
-        """管理员：立即查询余额并验证当前接口配置。"""
+        """管理员：查询所有已启用平台的余额，并验证接口配置。"""
         if not event.is_admin():
             yield event.plain_result("此命令仅 AstrBot 管理员可用。")
             return
-        try:
-            balance = await self._query_balance()
-            self._last_balance, self._last_query_error = balance, None
-            yield event.plain_result(self._balance_status_text(balance))
-        except BalanceQueryError as exc:
-            yield event.plain_result(f"余额查询失败：{exc}")
+        providers = self._enabled_providers()
+        if not providers:
+            yield event.plain_result(self._no_provider_text())
+            return
+
+        threshold = self._decimal_config("low_balance_threshold")
+        sections: list[str] = []
+        for provider in providers:
+            try:
+                balance = await self._query_provider_balance(provider)
+            except BalanceQueryError as exc:
+                self._last_query_errors[provider] = str(exc)
+                sections.append(
+                    f"{self._provider_label(provider)}：查询失败（{exc}）"
+                )
+                continue
+            self._last_balances[provider] = balance
+            self._last_query_errors.pop(provider, None)
+            sections.append(self._provider_status_text(provider, balance, threshold))
+        yield event.plain_result("\n\n".join(sections))
 
     @filter.command("余额告警测试")
     async def test_alert_in_chat(self, event: AstrMessageEvent):
-        """管理员：使用示例低余额在当前会话测试告警样式。"""
+        """管理员：使用示例低余额在当前会话测试各平台的告警样式。"""
         if not event.is_admin():
             yield event.plain_result("此命令仅 AstrBot 管理员可用。")
             return
@@ -101,20 +116,23 @@ class INeedMoneyPlugin(Star):
                 raise BalanceQueryError("配置项 low_balance_threshold 不能小于 0")
             test_threshold = threshold if threshold > 0 else Decimal("1")
             test_balance = test_threshold / Decimal("2")
+        except BalanceQueryError as exc:
+            yield event.plain_result(f"余额告警测试失败：{exc}")
+            return
+
+        for provider in self._preview_providers():
             chain = MessageChain().message(
-                "[告警样式测试]\n"
+                f"[告警样式测试 · {self._provider_label(provider)}]\n"
                 + await self._alert_text(
-                    test_balance, test_threshold, event.unified_msg_origin
+                    provider, test_balance, test_threshold, event.unified_msg_origin
                 )
             )
             self._append_receipt_images(chain)
             yield event.chain_result(chain)
-        except BalanceQueryError as exc:
-            yield event.plain_result(f"余额告警测试失败：{exc}")
 
     @filter.command("余额恢复测试")
     async def test_recovery_in_chat(self, event: AstrMessageEvent):
-        """管理员：使用示例高余额在当前会话测试恢复感谢消息。"""
+        """管理员：使用示例高余额在当前会话测试各平台的恢复感谢消息。"""
         if not event.is_admin():
             yield event.plain_result("此命令仅 AstrBot 管理员可用。")
             return
@@ -124,14 +142,17 @@ class INeedMoneyPlugin(Star):
                 raise BalanceQueryError("配置项 low_balance_threshold 不能小于 0")
             test_threshold = threshold
             test_balance = threshold + (Decimal("1") if threshold >= 0 else Decimal("2"))
-            yield event.plain_result(
-                "[余额恢复测试]\n"
-                + await self._recovery_text(
-                    test_balance, test_threshold, event.unified_msg_origin
-                )
-            )
         except BalanceQueryError as exc:
             yield event.plain_result(f"余额恢复测试失败：{exc}")
+            return
+
+        for provider in self._preview_providers():
+            yield event.plain_result(
+                f"[余额恢复测试 · {self._provider_label(provider)}]\n"
+                + await self._recovery_text(
+                    provider, test_balance, test_threshold, event.unified_msg_origin
+                )
+            )
 
     @filter.command("余额监控会话")
     async def show_session_id(self, event: AstrMessageEvent):
@@ -162,16 +183,34 @@ class INeedMoneyPlugin(Star):
 
     @filter.command("余额监控状态")
     async def monitor_status(self, event: AstrMessageEvent):
-        """管理员：查看后台最近一次查询，不额外发起 API 请求。"""
+        """管理员：查看各平台最近一次查询结果，不额外发起 API 请求。"""
         if not event.is_admin():
             yield event.plain_result("此命令仅 AstrBot 管理员可用。")
             return
-        if self._last_query_error:
-            yield event.plain_result(f"余额监控最近一次查询失败：{self._last_query_error}")
-        elif self._last_balance is None:
-            yield event.plain_result("余额监控尚未完成一次查询。")
-        else:
-            yield event.plain_result(self._balance_status_text(self._last_balance))
+        providers = self._enabled_providers()
+        if not providers:
+            yield event.plain_result(self._no_provider_text())
+            return
+
+        threshold = self._decimal_config("low_balance_threshold")
+        sections: list[str] = []
+        for provider in providers:
+            error = self._last_query_errors.get(provider)
+            balance = self._last_balances.get(provider)
+            if error:
+                sections.append(
+                    f"{self._provider_label(provider)}：最近一次查询失败"
+                    f"（{error}）"
+                )
+            elif balance is None:
+                sections.append(
+                    f"{self._provider_label(provider)}：尚未完成一次查询"
+                )
+            else:
+                sections.append(
+                    self._provider_status_text(provider, balance, threshold)
+                )
+        yield event.plain_result("\n\n".join(sections))
 
     async def _poll_loop(self) -> None:
         while True:
@@ -187,32 +226,52 @@ class INeedMoneyPlugin(Star):
 
     async def _check_and_notify(self) -> None:
         async with self._check_lock:
+            providers = self._enabled_providers()
+            if not providers:
+                logger.warning(
+                    "Balance monitor is enabled, but no provider switch is turned on."
+                )
+                return
             try:
-                balance = await self._query_balance()
-                self._last_balance, self._last_query_error = balance, None
                 threshold = self._decimal_config("low_balance_threshold")
                 if threshold < 0:
                     raise BalanceQueryError("配置项 low_balance_threshold 不能小于 0")
             except BalanceQueryError as exc:
-                self._last_query_error = str(exc)
-                logger.warning("Balance query failed: %s", exc)
+                logger.warning("Balance monitor configuration is invalid: %s", exc)
                 return
 
-            if balance >= threshold:
-                if self._is_low_balance:
-                    logger.info("Balance recovered above the configured threshold.")
-                    await self._send_recovery_notice(balance, threshold)
-                self._is_low_balance, self._last_alert_at = False, None
-                return
+            for provider in providers:
+                label = self._provider_label(provider)
+                try:
+                    balance = await self._query_provider_balance(provider)
+                except BalanceQueryError as exc:
+                    self._last_query_errors[provider] = str(exc)
+                    logger.warning("[%s] Balance query failed: %s", label, exc)
+                    continue
+                self._last_balances[provider] = balance
+                self._last_query_errors.pop(provider, None)
 
-            self._is_low_balance = True
-            if not self._alert_is_due():
-                return
-            if await self._send_low_balance_alert(balance, threshold):
-                self._last_alert_at = time.monotonic()
+                if balance >= threshold:
+                    if self._low_balance_states.get(provider):
+                        logger.info(
+                            "[%s] Balance recovered above the configured threshold.",
+                            label,
+                        )
+                        await self._send_recovery_notice(
+                            provider, balance, threshold
+                        )
+                    self._low_balance_states[provider] = False
+                    self._last_alert_at.pop(provider, None)
+                    continue
+
+                self._low_balance_states[provider] = True
+                if not self._alert_is_due(provider):
+                    continue
+                if await self._send_low_balance_alert(provider, balance, threshold):
+                    self._last_alert_at[provider] = time.monotonic()
 
     async def _send_recovery_notice(
-        self, balance: Decimal, threshold: Decimal
+        self, provider: str, balance: Decimal, threshold: Decimal
     ) -> bool:
         sessions = self._string_list_config("notification_sessions")
         if not sessions:
@@ -224,7 +283,7 @@ class INeedMoneyPlugin(Star):
         delivered = False
         for session in sessions:
             chain = MessageChain().message(
-                await self._recovery_text(balance, threshold, session)
+                await self._recovery_text(provider, balance, threshold, session)
             )
             try:
                 sent = await self.context.send_message(session, chain)
@@ -241,15 +300,14 @@ class INeedMoneyPlugin(Star):
                 )
         return delivered
 
-    async def _query_balance(self) -> Decimal:
-        platform = self._platform_key()
-        if platform == "deepseek":
+    async def _query_provider_balance(self, provider: str) -> Decimal:
+        if provider == "deepseek":
             return await self._query_deepseek_balance()
-        if platform == "derouter":
+        if provider == "derouter":
             return await self._query_derouter_balance()
-        if platform == "custom":
+        if provider == "custom":
             return await self._query_custom_balance()
-        raise BalanceQueryError("暂不支持所选余额查询平台")
+        raise BalanceQueryError(f"暂不支持的余额查询平台：{provider}")
 
     async def _query_deepseek_balance(self) -> Decimal:
         """Call the fixed DeepSeek endpoint so users only need to provide an API key."""
@@ -314,10 +372,8 @@ class INeedMoneyPlugin(Star):
         return balance
 
     def _deepseek_api_key(self) -> str:
-        """Return a bare DeepSeek key; accept the old Bearer form during migration."""
-        api_key = self._string_config("api_key").strip()
-        if not api_key:
-            api_key = self._string_config("balance_api_token").strip()
+        """Return a bare DeepSeek key, accepting a pasted Bearer form."""
+        api_key = self._string_config("deepseek_api_key").strip()
         if api_key.lower().startswith("bearer "):
             api_key = api_key[7:].strip()
         if not api_key:
@@ -328,10 +384,9 @@ class INeedMoneyPlugin(Star):
 
     async def _query_derouter_balance(self) -> Decimal:
         """Call derouter's preset endpoint; users only need to provide a key."""
-        derouter = self._derouter_api_config()
-        api_key = self._derouter_api_key(derouter)
+        api_key = self._derouter_api_key()
         base_url = (
-            self._custom_string_config(derouter, "base_url", DEROUTER_BASE_URL)
+            self._string_config("derouter_base_url", DEROUTER_BASE_URL)
             .strip()
             .rstrip("/")
         )
@@ -339,7 +394,7 @@ class INeedMoneyPlugin(Star):
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise BalanceQueryError("derouter API 地址必须是有效的 http 或 https URL")
 
-        is_customer_key = self._derouter_key_type(derouter) == "customer"
+        is_customer_key = self._derouter_key_type() == "customer"
         endpoint = (
             DEROUTER_CUSTOMER_ENDPOINT if is_customer_key else DEROUTER_ACCOUNT_ENDPOINT
         )
@@ -386,22 +441,19 @@ class INeedMoneyPlugin(Star):
 
     async def _query_custom_balance(self) -> Decimal:
         """Query an advanced, user-supplied JSON balance endpoint."""
-        custom = self._custom_api_config()
-        url = self._custom_string_config(custom, "balance_api_url").strip()
+        url = self._string_config("custom_balance_api_url").strip()
         if not url:
             raise BalanceQueryError("请先在自定义接口配置中填写余额 API 地址")
         parsed = urlparse(url)
         if parsed.scheme not in {"http", "https"} or not parsed.netloc:
             raise BalanceQueryError("自定义余额 API 地址必须是有效的 http 或 https URL")
 
-        method = self._custom_string_config(custom, "balance_api_method", "GET").upper()
+        method = self._string_config("custom_balance_api_method", "GET").strip().upper()
         if method not in {"GET", "POST"}:
             raise BalanceQueryError("自定义余额 API 请求方法仅支持 GET 或 POST")
-        request_kwargs: dict[str, Any] = {
-            "headers": self._build_custom_headers(custom)
-        }
+        request_kwargs: dict[str, Any] = {"headers": self._build_custom_headers()}
         if method == "POST":
-            request_kwargs["json"] = self._custom_request_json_body(custom)
+            request_kwargs["json"] = self._custom_request_json_body()
 
         timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
         try:
@@ -426,14 +478,13 @@ class INeedMoneyPlugin(Star):
         except json.JSONDecodeError as exc:
             raise BalanceQueryError("自定义余额 API 未返回 JSON 数据") from exc
         value = self._extract_json_path(
-            payload,
-            self._custom_string_config(custom, "balance_json_path", "data.balance"),
+            payload, self._string_config("custom_balance_json_path", "data.balance")
         )
         if value is None or isinstance(value, bool):
             raise BalanceQueryError("自定义接口返回的余额不是数值")
         try:
-            balance = Decimal(str(value)) * self._custom_decimal_config(
-                custom, "balance_scale", "1"
+            balance = Decimal(str(value)) * self._decimal_config(
+                "custom_balance_scale", "1"
             )
         except (InvalidOperation, ValueError) as exc:
             raise BalanceQueryError("自定义接口返回的余额不是可识别的数值") from exc
@@ -441,17 +492,18 @@ class INeedMoneyPlugin(Star):
             raise BalanceQueryError("自定义接口返回的余额不是有限数值")
         return balance
 
-    def _build_custom_headers(self, custom: Mapping[str, Any]) -> dict[str, str]:
+    def _build_custom_headers(self) -> dict[str, str]:
         headers = {"Accept": "application/json"}
-        token = self._custom_string_config(custom, "api_token")
+        token = self._string_config("custom_api_token").strip()
         if token:
-            name = self._custom_string_config(
-                custom, "token_header_name", "Authorization"
+            name = (
+                self._string_config("custom_token_header_name", "Authorization").strip()
+                or "Authorization"
             )
             self._validate_header(name, token)
             headers[name] = token
 
-        custom_headers_text = self._custom_string_config(custom, "custom_headers_json")
+        custom_headers_text = self._string_config("custom_headers_json")
         if not custom_headers_text.strip():
             return headers
         try:
@@ -474,8 +526,8 @@ class INeedMoneyPlugin(Star):
         if "\r" in value or "\n" in value:
             raise BalanceQueryError("请求头值不合法")
 
-    def _custom_request_json_body(self, custom: Mapping[str, Any]) -> Any:
-        body = self._custom_string_config(custom, "balance_api_body_json")
+    def _custom_request_json_body(self) -> Any:
+        body = self._string_config("custom_balance_api_body_json")
         if not body.strip():
             return None
         try:
@@ -505,7 +557,7 @@ class INeedMoneyPlugin(Star):
         return current
 
     async def _send_low_balance_alert(
-        self, balance: Decimal, threshold: Decimal
+        self, provider: str, balance: Decimal, threshold: Decimal
     ) -> bool:
         sessions = self._string_list_config("notification_sessions")
         if not sessions:
@@ -514,7 +566,7 @@ class INeedMoneyPlugin(Star):
         delivered = False
         for session in sessions:
             chain = MessageChain().message(
-                await self._alert_text(balance, threshold, session)
+                await self._alert_text(provider, balance, threshold, session)
             )
             self._append_receipt_images(chain)
             try:
@@ -529,14 +581,13 @@ class INeedMoneyPlugin(Star):
         return delivered
 
     async def _alert_text(
-        self, balance: Decimal, threshold: Decimal, session: str | None = None
+        self,
+        provider: str,
+        balance: Decimal,
+        threshold: Decimal,
+        session: str | None = None,
     ) -> str:
-        fields = {
-            "account_name": self._platform_display_name(),
-            "balance": f"{balance:.2f}",
-            "threshold": f"{threshold:.2f}",
-            "unit": self._platform_currency(),
-        }
+        fields = self._template_fields(provider, balance, threshold)
         template, persona_prompt = await self._persona_alert_context(session)
         try:
             rendered_template = template.format(**fields)
@@ -547,14 +598,13 @@ class INeedMoneyPlugin(Star):
         )
 
     async def _recovery_text(
-        self, balance: Decimal, threshold: Decimal, session: str | None = None
+        self,
+        provider: str,
+        balance: Decimal,
+        threshold: Decimal,
+        session: str | None = None,
     ) -> str:
-        fields = {
-            "account_name": self._platform_display_name(),
-            "balance": f"{balance:.2f}",
-            "threshold": f"{threshold:.2f}",
-            "unit": self._platform_currency(),
-        }
+        fields = self._template_fields(provider, balance, threshold)
         _, persona_prompt = await self._persona_alert_context(session)
         template = self._string_config(
             "recovery_message_template", DEFAULT_RECOVERY_MESSAGE
@@ -566,6 +616,16 @@ class INeedMoneyPlugin(Star):
         return await self._generate_persona_alert(
             rendered_template, fields, persona_prompt, session
         )
+
+    def _template_fields(
+        self, provider: str, balance: Decimal, threshold: Decimal
+    ) -> dict[str, str]:
+        return {
+            "account_name": self._provider_display_name(provider),
+            "balance": f"{balance:.2f}",
+            "threshold": f"{threshold:.2f}",
+            "unit": self._provider_currency(provider),
+        }
 
     async def _persona_alert_context(
         self, session: str | None
@@ -743,92 +803,164 @@ class INeedMoneyPlugin(Star):
             return 1.0
         return float(min(Decimal("2"), max(Decimal("0"), value)))
 
-    def _balance_status_text(self, balance: Decimal) -> str:
-        threshold = self._decimal_config("low_balance_threshold")
+    def _provider_status_text(
+        self, provider: str, balance: Decimal, threshold: Decimal
+    ) -> str:
+        unit = self._provider_currency(provider)
         level = "余额不足" if balance < threshold else "余额充足"
         return (
-            f"{self._platform_display_name()} 当前余额："
-            f"{balance:.2f} {self._platform_currency()}\n"
-            f"告警阈值：{threshold:.2f} {self._platform_currency()}\n状态：{level}"
+            f"{self._provider_display_name(provider)} 当前余额："
+            f"{balance:.2f} {unit}\n"
+            f"告警阈值：{threshold:.2f} {unit}\n状态：{level}"
         )
 
-    def _platform_display_name(self) -> str:
-        platform = self._platform_key()
-        if platform == "deepseek":
+    @staticmethod
+    def _provider_order() -> tuple[str, ...]:
+        return ("deepseek", "derouter", "custom")
+
+    @staticmethod
+    def _provider_label(provider: str) -> str:
+        if provider == "deepseek":
             return "DeepSeek"
-        if platform == "derouter":
-            return self._custom_string_config(
-                self._derouter_api_config(), "account_name", "derouter"
-            )
-        return self._custom_string_config(
-            self._custom_api_config(), "account_name", "自定义 AI API"
-        )
-
-    def _platform_currency(self) -> str:
-        platform = self._platform_key()
-        if platform == "deepseek":
-            return DEEPSEEK_CURRENCY
-        if platform == "derouter":
-            return self._custom_string_config(
-                self._derouter_api_config(), "balance_unit", DEROUTER_CURRENCY
-            )
-        return self._custom_string_config(
-            self._custom_api_config(), "balance_unit", "USD"
-        )
-
-    def _platform_key(self) -> str:
-        platform = self._string_config("platform", "deepseek").strip().lower()
-        if platform in {"custom", "自定义接口"}:
-            return "custom"
-        if platform in {"derouter", "de_router", "derouter.ai"}:
+        if provider == "derouter":
             return "derouter"
-        return platform
+        return "自定义接口"
 
-    def _derouter_api_config(self) -> Mapping[str, Any]:
-        value = self.config.get("derouter_api", {})
-        return value if isinstance(value, Mapping) else {}
+    def _enabled_providers(self) -> list[str]:
+        return [
+            provider
+            for provider in self._provider_order()
+            if self._bool_config(f"{provider}_enabled")
+        ]
 
-    def _derouter_api_key(self, derouter: Mapping[str, Any]) -> str:
-        api_key = self._custom_string_config(derouter, "api_key").strip()
+    def _preview_providers(self) -> list[str]:
+        """Providers used by test commands: enabled ones, or all when none is on."""
+        return self._enabled_providers() or list(self._provider_order())
+
+    def _no_provider_text(self) -> str:
+        return (
+            "尚未启用任何余额监控平台，请先在插件配置中打开对应开关："
+            "启用 DeepSeek 余额监控、启用 derouter 余额监控、启用自定义接口余额监控。"
+        )
+
+    def _provider_display_name(self, provider: str) -> str:
+        if provider == "deepseek":
+            return (
+                self._string_config("deepseek_account_name", "DeepSeek").strip()
+                or "DeepSeek"
+            )
+        if provider == "derouter":
+            return (
+                self._string_config("derouter_account_name", "derouter").strip()
+                or "derouter"
+            )
+        return (
+            self._string_config("custom_account_name", "自定义 AI API").strip()
+            or "自定义 AI API"
+        )
+
+    def _provider_currency(self, provider: str) -> str:
+        if provider == "deepseek":
+            return DEEPSEEK_CURRENCY
+        if provider == "derouter":
+            return (
+                self._string_config("derouter_balance_unit", DEROUTER_CURRENCY).strip()
+                or DEROUTER_CURRENCY
+            )
+        return self._string_config("custom_balance_unit", "USD").strip() or "USD"
+
+    def _derouter_api_key(self) -> str:
+        api_key = self._string_config("derouter_api_key").strip()
         if api_key.lower().startswith("bearer "):
             api_key = api_key[7:].strip()
         if not api_key:
-            raise BalanceQueryError("请先在 derouter 配置中填写密钥")
+            raise BalanceQueryError("请先在插件配置中填写 derouter 密钥")
         if "\r" in api_key or "\n" in api_key:
             raise BalanceQueryError("derouter 密钥格式无效")
         return api_key
 
-    @staticmethod
-    def _derouter_key_type(derouter: Mapping[str, Any]) -> str:
-        value = derouter.get("key_type", "账户密钥")
-        if not isinstance(value, str):
-            return "account"
+    def _derouter_key_type(self) -> str:
+        value = self._string_config("derouter_key_type", "账户密钥")
         if value.strip().lower() in {"客户密钥", "customer", "sub-key", "subkey"}:
             return "customer"
         return "account"
 
-    def _custom_api_config(self) -> Mapping[str, Any]:
-        value = self.config.get("custom_api", {})
-        return value if isinstance(value, Mapping) else {}
+    def _bool_config(self, key: str, default: bool = False) -> bool:
+        return bool(self.config.get(key, default))
 
-    @staticmethod
-    def _custom_string_config(
-        custom: Mapping[str, Any], key: str, default: str = ""
-    ) -> str:
-        value = custom.get(key, default)
-        return value if isinstance(value, str) else default
+    def _migrate_legacy_config(self) -> None:
+        """Move the previous single-platform config onto the flat per-provider keys."""
+        legacy_platform = self._string_config("platform").strip().lower()
+        if not legacy_platform:
+            return
 
-    @staticmethod
-    def _custom_decimal_config(
-        custom: Mapping[str, Any], key: str, default: str = "0"
-    ) -> Decimal:
-        try:
-            value = Decimal(str(custom.get(key, default)))
-        except (InvalidOperation, ValueError, TypeError):
-            raise BalanceQueryError(f"自定义接口配置项 {key} 不是有效数值") from None
-        if not value.is_finite():
-            raise BalanceQueryError(f"自定义接口配置项 {key} 不是有限数值")
-        return value
+        legacy_derouter = self.config.get("derouter_api")
+        legacy_derouter = legacy_derouter if isinstance(legacy_derouter, Mapping) else {}
+        legacy_custom = self.config.get("custom_api")
+        legacy_custom = legacy_custom if isinstance(legacy_custom, Mapping) else {}
+
+        def legacy_text(source: Mapping[str, Any], key: str) -> str:
+            value = source.get(key)
+            return value.strip() if isinstance(value, str) else ""
+
+        updates: dict[str, Any] = {}
+        if legacy_platform == "deepseek":
+            legacy_key = self._string_config("api_key").strip()
+            if legacy_key:
+                updates["deepseek_api_key"] = legacy_key
+                updates["deepseek_enabled"] = True
+        elif legacy_platform in {"derouter", "de_router", "derouter.ai"}:
+            for new_key, old_key in (
+                ("derouter_api_key", "api_key"),
+                ("derouter_key_type", "key_type"),
+                ("derouter_base_url", "base_url"),
+                ("derouter_account_name", "account_name"),
+                ("derouter_balance_unit", "balance_unit"),
+            ):
+                value = legacy_text(legacy_derouter, old_key)
+                if value:
+                    updates[new_key] = value
+            if str(updates.get("derouter_api_key", "")).strip():
+                updates["derouter_enabled"] = True
+        elif legacy_platform in {"custom", "自定义接口"}:
+            for new_key, old_key in (
+                ("custom_account_name", "account_name"),
+                ("custom_balance_api_url", "balance_api_url"),
+                ("custom_balance_api_method", "balance_api_method"),
+                ("custom_api_token", "api_token"),
+                ("custom_token_header_name", "token_header_name"),
+                ("custom_headers_json", "custom_headers_json"),
+                ("custom_balance_api_body_json", "balance_api_body_json"),
+                ("custom_balance_json_path", "balance_json_path"),
+                ("custom_balance_unit", "balance_unit"),
+            ):
+                value = legacy_text(legacy_custom, old_key)
+                if value:
+                    updates[new_key] = value
+            legacy_scale = legacy_custom.get("balance_scale")
+            if (
+                isinstance(legacy_scale, (int, float))
+                and not isinstance(legacy_scale, bool)
+                and legacy_scale > 0
+            ):
+                updates["custom_balance_scale"] = float(legacy_scale)
+            if str(updates.get("custom_balance_api_url", "")).strip():
+                updates["custom_enabled"] = True
+
+        # 清理旧字段，保证迁移只执行一次
+        updates["platform"] = ""
+        updates["api_key"] = ""
+        updates["derouter_api"] = {}
+        updates["custom_api"] = {}
+
+        for key, value in updates.items():
+            self.config[key] = value
+        self.config.save_config()
+        logger.info(
+            "INeedMoney migrated legacy single-platform config (%s) to the "
+            "flat multi-provider layout.",
+            legacy_platform,
+        )
 
     @staticmethod
     def _to_balance(value: Any, source: str) -> Decimal:
@@ -842,11 +974,12 @@ class INeedMoneyPlugin(Star):
             raise BalanceQueryError(f"{source}不是有限数值")
         return balance
 
-    def _alert_is_due(self) -> bool:
-        if self._last_alert_at is None:
+    def _alert_is_due(self, provider: str) -> bool:
+        last_alert_at = self._last_alert_at.get(provider)
+        if last_alert_at is None:
             return True
         cooldown = max(0, self._int_config("alert_cooldown_minutes", 360)) * 60
-        return time.monotonic() - self._last_alert_at >= cooldown
+        return time.monotonic() - last_alert_at >= cooldown
 
     def _receipt_image_sources(self) -> list[str]:
         """Resolve every configured receipt code, keeping the upload order."""
