@@ -620,8 +620,7 @@ class INeedMoneyPlugin(Star):
                             session,
                         )
             provider_id = await self.context.get_current_chat_provider_id(session)
-            temperature = self._decimal_config("alert_temperature", "1.0")
-            temperature = min(Decimal("2"), max(Decimal("0"), temperature))
+            temperature = self._alert_temperature()
             logger.info(
                 "Generating Persona-based balance message in native conversation "
                 "for session %s with provider %s.",
@@ -629,27 +628,19 @@ class INeedMoneyPlugin(Star):
                 provider_id,
             )
             prompt = (
-                "请把下面的余额提醒模板改写成一条可以直接发送给用户的消息。\n"
-                "必须遵循当前 Persona 的语气，但不要解释改写过程，不要添加标题、Markdown 或引号。\n"
-                "必须保留以下事实值，不能修改、四舍五入、翻译或省略："
+                "用当前 Persona 的语气，把下面这条余额提醒改写成一条可以直接发给用户的消息。\n"
+                "保留这些事实值，不要改动、四舍五入或翻译："
                 f"账户={fields['account_name']}，余额={fields['balance']}，"
                 f"阈值={fields['threshold']}，单位={fields['unit']}。\n\n"
-                f"余额提醒模板：\n{rendered_template}\n\n"
-                "只输出改写后的这一条消息正文本身。\n"
-                "不要输出任何前言、后记、解释、说明、标题、Markdown、引号或代码块，"
-                "也不要出现‘好的’、‘以下是’等引导语。"
+                f"余额提醒模板：\n{rendered_template}"
             )
-            constrained_persona_prompt = (
-                f"{persona_prompt}\n\n"
-                "[硬性输出要求] 只能输出改写后的消息正文，禁止输出前言、后记、"
-                "解释、标题、Markdown、引号或代码块。"
-            )
+            constrained_persona_prompt = f"{persona_prompt}\n\n用你的人格口吻直接说出这条消息，不要解释。"
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
                 system_prompt=constrained_persona_prompt,
                 contexts=contexts,
-                temperature=float(temperature),
+                temperature=temperature,
             )
             generated = self._clean_generated_message(response.completion_text or "")
             if generated and all(value in generated for value in fields.values()):
@@ -682,15 +673,30 @@ class INeedMoneyPlugin(Star):
     def _clean_generated_message(generated: str) -> str:
         generated = generated.strip()
         if generated.startswith("```"):
-            generated = re.sub(r"^```[^\n]*\n?", "", generated, count=1)
-            generated = re.sub(r"\n?```$", "", generated, count=1).strip()
+            generated = re.sub(r"^```[a-zA-Z]*\s*\n?", "", generated, count=1)
+            generated = re.sub(r"\n?```\s*$", "", generated, count=1).strip()
         generated = generated.strip('"\'“”‘’「」『』`').strip()
         generated = re.sub(
-            r"^(好的|好嘞|没问题|以下是|这是|改写后|改写结果)[，,：:\s]*",
+            r"^(好的|好嘞|没问题|当然|以下是|这是|改写后|改写结果)[，,：:！!。\s]*",
             "",
             generated,
         ).strip()
+        generated = re.sub(
+            r"[（(]\s*说明[:：].*?[)）]\s*$", "", generated, flags=re.DOTALL
+        ).strip()
         return generated
+
+    def _alert_temperature(self) -> float:
+        """Return a clamped temperature; invalid config falls back to 1.0."""
+        try:
+            value = Decimal(str(self.config.get("alert_temperature", "1.0")))
+        except (InvalidOperation, ValueError, TypeError):
+            logger.warning("配置项 alert_temperature 不是有效数值，将使用默认值 1.0。")
+            return 1.0
+        if not value.is_finite():
+            logger.warning("配置项 alert_temperature 不是有限数值，将使用默认值 1.0。")
+            return 1.0
+        return float(min(Decimal("2"), max(Decimal("0"), value)))
 
     def _balance_status_text(self, balance: Decimal) -> str:
         threshold = self._decimal_config("low_balance_threshold")
