@@ -1,8 +1,8 @@
 name: ineedmoney
-display_name: AI API 余额监控
+display_name: 给我打钱！
 desc: 定时检查 DeepSeek 或自定义 API 余额，并在余额不足时向指定会话发送充值提醒和收款码。
-short_desc: AI API 余额不足时主动提醒充值。
-version: v1.0.1
+short_desc: 给我打钱！金金金金金金，钱钱钱钱钱钱！
+version: v1.0.2
 author: RogerNoROG
 repo: https://github.com/RogerNoROG/astrbot_plugin_INeedMoney
 astrbot_version: ">=4.13,<5"

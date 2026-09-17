@@ -376,7 +376,11 @@ class INeedMoneyPlugin(Star):
             "threshold": f"{threshold:.2f}",
             "unit": self._platform_currency(),
         }
-        return DEFAULT_ALERT_MESSAGE.format(**fields)
+        template = self._string_config("alert_message_template", DEFAULT_ALERT_MESSAGE)
+        try:
+            return template.format(**fields)
+        except (KeyError, ValueError):
+            return DEFAULT_ALERT_MESSAGE.format(**fields)
 
     def _balance_status_text(self, balance: Decimal) -> str:
         threshold = self._decimal_config("low_balance_threshold")

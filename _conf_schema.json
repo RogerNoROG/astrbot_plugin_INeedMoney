@@ -1,4 +1,12 @@
 {
+  "alert_message_template": {
+    "type": "text",
+    "description": "余额提醒模板",
+    "hint": "可自定义告警文案，支持 {account_name}、{balance}、{threshold}、{unit} 这些占位符。",
+    "editor_mode": true,
+    "editor_language": "text",
+    "default": "[余额告警]\n{account_name} 当前余额为 {balance} {unit}，已低于告警阈值 {threshold} {unit}。\n请及时充值，避免服务中断。"
+  },
   "enabled": {
     "type": "bool",
     "description": "启用余额监控",
