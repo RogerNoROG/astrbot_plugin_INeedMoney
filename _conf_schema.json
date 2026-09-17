@@ -26,21 +26,61 @@
   "platform": {
     "type": "string",
     "description": "AI 平台",
-    "hint": "普通用户选择 DeepSeek；只有接口格式不同的高级用户才选择自定义接口。",
-    "options": ["DeepSeek", "自定义接口"],
+    "hint": "选择余额查询平台。DeepSeek 与 derouter 的接口地址和余额字段已内置，自定义接口供其他服务商使用。",
+    "options": ["DeepSeek", "derouter", "自定义接口"],
     "default": "DeepSeek"
   },
   "api_key": {
     "type": "string",
     "description": "DeepSeek API Key",
-    "hint": "粘贴 DeepSeek 平台生成的 API Key，例如 sk-...；无需填写 Bearer。此项仅遮罩 WebUI 显示，不会加密配置文件。",
+    "hint": "仅在选择 DeepSeek 平台时使用。粘贴 DeepSeek 平台生成的 API Key，例如 sk-...；无需填写 Bearer。此项仅遮罩 WebUI 显示，不会加密配置文件。",
     "secret": true,
     "default": ""
+  },
+  "derouter_api": {
+    "type": "object",
+    "description": "derouter 余额接口",
+    "hint": "仅当“AI 平台”选择 derouter 时使用。接口地址、请求方式和余额字段已按官方文档预设，通常只需填写密钥。",
+    "items": {
+      "account_name": {
+        "type": "string",
+        "description": "账户名称",
+        "hint": "用于余额查询结果和充值提醒。",
+        "default": "derouter"
+      },
+      "api_key": {
+        "type": "string",
+        "description": "derouter 密钥",
+        "hint": "粘贴 sk-ant-... 形式的账户密钥或客户密钥；无需填写 Bearer。",
+        "secret": true,
+        "default": ""
+      },
+      "key_type": {
+        "type": "string",
+        "description": "密钥类型",
+        "hint": "账户密钥查询账户可用余额（/balance）；客户密钥查询该密钥剩余额度（/sub-key/balance）。",
+        "options": ["账户密钥", "客户密钥"],
+        "default": "账户密钥"
+      },
+      "base_url": {
+        "type": "string",
+        "description": "API 地址",
+        "hint": "默认 https://cf-api.derouter.ai，使用反代时再修改。",
+        "default": "https://cf-api.derouter.ai"
+      },
+      "balance_unit": {
+        "type": "string",
+        "description": "余额单位",
+        "hint": "用于显示余额和告警阈值，derouter 默认使用 USD。",
+        "default": "USD"
+      }
+    },
+    "default": {}
   },
   "custom_api": {
     "type": "object",
     "description": "高级：自定义余额接口",
-    "hint": "仅当“AI 平台”选择“自定义接口”时填写。DeepSeek 用户无需展开或配置此表单。接口必须返回 JSON，余额字段由“余额 JSON 路径”指定。",
+    "hint": "仅当“AI 平台”选择“自定义接口”时填写。DeepSeek 和 derouter 用户无需展开或配置此表单。接口必须返回 JSON，余额字段由“余额 JSON 路径”指定。",
     "items": {
       "account_name": {
         "type": "string",

@@ -29,6 +29,10 @@ DEFAULT_RECOVERY_MESSAGE = (
 )
 DEEPSEEK_BALANCE_URL = "https://api.deepseek.com/user/balance"
 DEEPSEEK_CURRENCY = "CNY"
+DEROUTER_BASE_URL = "https://cf-api.derouter.ai"
+DEROUTER_ACCOUNT_ENDPOINT = "/balance"
+DEROUTER_CUSTOMER_ENDPOINT = "/sub-key/balance"
+DEROUTER_CURRENCY = "USD"
 REQUEST_TIMEOUT_SECONDS = 15
 
 
@@ -241,6 +245,8 @@ class INeedMoneyPlugin(Star):
         platform = self._platform_key()
         if platform == "deepseek":
             return await self._query_deepseek_balance()
+        if platform == "derouter":
+            return await self._query_derouter_balance()
         if platform == "custom":
             return await self._query_custom_balance()
         raise BalanceQueryError("暂不支持所选余额查询平台")
@@ -319,6 +325,64 @@ class INeedMoneyPlugin(Star):
         if "\r" in api_key or "\n" in api_key:
             raise BalanceQueryError("DeepSeek API Key 格式无效")
         return api_key
+
+    async def _query_derouter_balance(self) -> Decimal:
+        """Call derouter's preset endpoint; users only need to provide a key."""
+        derouter = self._derouter_api_config()
+        api_key = self._derouter_api_key(derouter)
+        base_url = (
+            self._custom_string_config(derouter, "base_url", DEROUTER_BASE_URL)
+            .strip()
+            .rstrip("/")
+        )
+        parsed = urlparse(base_url)
+        if parsed.scheme not in {"http", "https"} or not parsed.netloc:
+            raise BalanceQueryError("derouter API 地址必须是有效的 http 或 https URL")
+
+        is_customer_key = self._derouter_key_type(derouter) == "customer"
+        endpoint = (
+            DEROUTER_CUSTOMER_ENDPOINT if is_customer_key else DEROUTER_ACCOUNT_ENDPOINT
+        )
+        field = "remaining" if is_customer_key else "available"
+        key_label = "客户密钥" if is_customer_key else "账户密钥"
+        api_label = f"derouter {key_label}余额接口"
+
+        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.get(
+                    f"{base_url}{endpoint}",
+                    headers={
+                        "Accept": "application/json",
+                        "Authorization": f"Bearer {api_key}",
+                    },
+                ) as response:
+                    response_text = await response.text()
+                    if response.status == 401:
+                        raise BalanceQueryError(f"{api_label} 鉴权失败，请检查密钥")
+                    if not 200 <= response.status < 300:
+                        raise BalanceQueryError(
+                            f"{api_label} 返回 HTTP {response.status}"
+                        )
+        except asyncio.CancelledError:
+            raise
+        except BalanceQueryError:
+            raise
+        except asyncio.TimeoutError as exc:
+            raise BalanceQueryError(f"{api_label} 请求超时") from exc
+        except aiohttp.ClientError as exc:
+            raise BalanceQueryError(f"无法连接 {api_label}：{exc}") from exc
+
+        try:
+            payload = json.loads(response_text)
+        except json.JSONDecodeError as exc:
+            raise BalanceQueryError(f"{api_label} 未返回 JSON 数据") from exc
+        if not isinstance(payload, Mapping):
+            raise BalanceQueryError(f"{api_label} 返回的数据格式无效")
+        error = payload.get("error")
+        if isinstance(error, str) and error.strip():
+            raise BalanceQueryError(f"{api_label} 返回错误：{error.strip()}")
+        return self._to_balance(payload.get(field), f"{api_label} 的 {field} 字段")
 
     async def _query_custom_balance(self) -> Decimal:
         """Query an advanced, user-supplied JSON balance endpoint."""
@@ -689,22 +753,59 @@ class INeedMoneyPlugin(Star):
         )
 
     def _platform_display_name(self) -> str:
-        if self._platform_key() == "deepseek":
+        platform = self._platform_key()
+        if platform == "deepseek":
             return "DeepSeek"
+        if platform == "derouter":
+            return self._custom_string_config(
+                self._derouter_api_config(), "account_name", "derouter"
+            )
         return self._custom_string_config(
             self._custom_api_config(), "account_name", "自定义 AI API"
         )
 
     def _platform_currency(self) -> str:
-        if self._platform_key() == "deepseek":
+        platform = self._platform_key()
+        if platform == "deepseek":
             return DEEPSEEK_CURRENCY
+        if platform == "derouter":
+            return self._custom_string_config(
+                self._derouter_api_config(), "balance_unit", DEROUTER_CURRENCY
+            )
         return self._custom_string_config(
             self._custom_api_config(), "balance_unit", "USD"
         )
 
     def _platform_key(self) -> str:
         platform = self._string_config("platform", "deepseek").strip().lower()
-        return "custom" if platform in {"custom", "自定义接口"} else platform
+        if platform in {"custom", "自定义接口"}:
+            return "custom"
+        if platform in {"derouter", "de_router", "derouter.ai"}:
+            return "derouter"
+        return platform
+
+    def _derouter_api_config(self) -> Mapping[str, Any]:
+        value = self.config.get("derouter_api", {})
+        return value if isinstance(value, Mapping) else {}
+
+    def _derouter_api_key(self, derouter: Mapping[str, Any]) -> str:
+        api_key = self._custom_string_config(derouter, "api_key").strip()
+        if api_key.lower().startswith("bearer "):
+            api_key = api_key[7:].strip()
+        if not api_key:
+            raise BalanceQueryError("请先在 derouter 配置中填写密钥")
+        if "\r" in api_key or "\n" in api_key:
+            raise BalanceQueryError("derouter 密钥格式无效")
+        return api_key
+
+    @staticmethod
+    def _derouter_key_type(derouter: Mapping[str, Any]) -> str:
+        value = derouter.get("key_type", "账户密钥")
+        if not isinstance(value, str):
+            return "account"
+        if value.strip().lower() in {"客户密钥", "customer", "sub-key", "subkey"}:
+            return "customer"
+        return "account"
 
     def _custom_api_config(self) -> Mapping[str, Any]:
         value = self.config.get("custom_api", {})
@@ -728,6 +829,18 @@ class INeedMoneyPlugin(Star):
         if not value.is_finite():
             raise BalanceQueryError(f"自定义接口配置项 {key} 不是有限数值")
         return value
+
+    @staticmethod
+    def _to_balance(value: Any, source: str) -> Decimal:
+        if value is None or isinstance(value, bool):
+            raise BalanceQueryError(f"{source}不是数值")
+        try:
+            balance = Decimal(str(value))
+        except (InvalidOperation, ValueError) as exc:
+            raise BalanceQueryError(f"{source}不是可识别的数值") from exc
+        if not balance.is_finite():
+            raise BalanceQueryError(f"{source}不是有限数值")
+        return balance
 
     def _alert_is_due(self) -> bool:
         if self._last_alert_at is None:
