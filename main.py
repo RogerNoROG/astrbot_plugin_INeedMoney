@@ -634,16 +634,24 @@ class INeedMoneyPlugin(Star):
                 "必须保留以下事实值，不能修改、四舍五入、翻译或省略："
                 f"账户={fields['account_name']}，余额={fields['balance']}，"
                 f"阈值={fields['threshold']}，单位={fields['unit']}。\n\n"
-                f"余额提醒模板：\n{rendered_template}"
+                f"余额提醒模板：\n{rendered_template}\n\n"
+                "只输出改写后的这一条消息正文本身。\n"
+                "不要输出任何前言、后记、解释、说明、标题、Markdown、引号或代码块，"
+                "也不要出现‘好的’、‘以下是’等引导语。"
+            )
+            constrained_persona_prompt = (
+                f"{persona_prompt}\n\n"
+                "[硬性输出要求] 只能输出改写后的消息正文，禁止输出前言、后记、"
+                "解释、标题、Markdown、引号或代码块。"
             )
             response = await self.context.llm_generate(
                 chat_provider_id=provider_id,
                 prompt=prompt,
-                system_prompt=persona_prompt,
+                system_prompt=constrained_persona_prompt,
                 contexts=contexts,
                 temperature=float(temperature),
             )
-            generated = (response.completion_text or "").strip()
+            generated = self._clean_generated_message(response.completion_text or "")
             if generated and all(value in generated for value in fields.values()):
                 if conversation_manager is not None:
                     if conversation_id is None:
@@ -669,6 +677,20 @@ class INeedMoneyPlugin(Star):
         except Exception:
             logger.exception("Failed to generate Persona-based balance message.")
         return rendered_template
+
+    @staticmethod
+    def _clean_generated_message(generated: str) -> str:
+        generated = generated.strip()
+        if generated.startswith("```"):
+            generated = re.sub(r"^```[^\n]*\n?", "", generated, count=1)
+            generated = re.sub(r"\n?```$", "", generated, count=1).strip()
+        generated = generated.strip('"\'“”‘’「」『』`').strip()
+        generated = re.sub(
+            r"^(好的|好嘞|没问题|以下是|这是|改写后|改写结果)[，,：:\s]*",
+            "",
+            generated,
+        ).strip()
+        return generated
 
     def _balance_status_text(self, balance: Decimal) -> str:
         threshold = self._decimal_config("low_balance_threshold")
